@@ -26,7 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = Path.home() / ".cache" / "mac-screen-record"
@@ -203,7 +203,7 @@ def screen_info(request: bool = False) -> dict:
 
 PERMISSION_PANES = {
     "screen_capture": (
-        "屏幕录制", "录屏、截图",
+        "屏幕录制", "录屏、截图、采集电脑声音",
         "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
     ),
     "listen_event": (
@@ -543,12 +543,173 @@ def point_to_pixel(x: float, y: float, meta: dict):
     return px, py
 
 
+# ---------------------------------------------------------------- 音频模式
+
+
+SYSTEM_AUDIO_MODES = ("none", "system", "mic", "mix")
+
+
+def prompt_audio_mode() -> str:
+    print("选择声音模式：")
+    print("  1) 纯录屏，无声音")
+    print("  2) 录屏 + 电脑播放的声音")
+    print("  3) 录屏 + 讲解旁白（麦克风）")
+    print("  4) 录屏 + 电脑声音 + 讲解旁白（混音）")
+    print("  5) 指定音频设备（高级）")
+    try:
+        choice = (input("输入 1-5 [1]: ").strip() or "1")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "none"
+    if choice == "2":
+        return "system"
+    if choice == "3":
+        return "mic"
+    if choice == "4":
+        return "mix"
+    if choice == "5":
+        try:
+            dev = input("音频设备 ID（数字）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "none"
+        return dev if dev.isdigit() else "none"
+    return "none"
+
+
+def resolve_audio_mode(args) -> str:
+    mode = args.audio
+    if mode is None:
+        if sys.stdin.isatty() and not getattr(args, "json", False):
+            mode = prompt_audio_mode()
+        else:
+            mode = "none"
+            print("ℹ️  未指定 --audio，默认静音（可选 none/system/mic/mix/<设备ID>）", file=sys.stderr)
+    if mode in SYSTEM_AUDIO_MODES:
+        return mode
+    if str(mode).isdigit():
+        return str(mode)
+    raise RecError("--audio 只接受 none / system / mic / mix / 数字设备 ID")
+
+
+def system_audio_check() -> dict:
+    try:
+        exe = ensure_helper("system_audio")
+        res = run([exe, "--check"], timeout=20, check=False)
+        return json.loads(res.stdout or "{}")
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
+def start_system_audio(path: Path, duration: float):
+    """启动 ScreenCaptureKit 系统音频采集，返回 (Popen, start_epoch, note)。"""
+    try:
+        exe = ensure_helper("system_audio")
+    except RecError as e:
+        return None, None, str(e)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    cmd = [str(exe), str(path)]
+    if duration > 0:
+        cmd += ["--duration", str(int(math.ceil(duration)) + 3)]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
+    except OSError as e:
+        return None, None, f"系统音频采集启动失败：{e}"
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            r, _, _ = select.select([p.stderr], [], [], 0.25)
+        except (OSError, ValueError):
+            break
+        if r:
+            line = (p.stderr.readline() or "").strip()
+            if line.startswith("AUDIO_STARTED"):
+                try:
+                    return p, float(line.split()[1]), "ok"
+                except (IndexError, ValueError):
+                    return p, time.time(), "ok"
+            if line.startswith("AUDIO_ERROR"):
+                try:
+                    p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                return None, None, line
+        if p.poll() is not None:
+            break
+    try:
+        p.terminate()
+        p.wait(timeout=2)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return None, None, "系统音频采集未就绪（ScreenCaptureKit 启动失败或被拒绝）"
+
+
+def transcode_with_system_audio(raw: Path, out: Path, info: dict, audio_mode: str,
+                                sys_path: Path, lead: float, args) -> bool:
+    """把系统音频（system）或系统+麦克风（mix）合成到 mp4。"""
+    try:
+        sys_info = probe(sys_path)
+    except RecError:
+        return False
+    if not sys_info or sys_info["duration"] <= 0:
+        return False
+
+    vf = []
+    if args.fps and args.fps > 0:
+        vf.append(f"fps={args.fps}")
+    if args.max_height and args.max_height > 0 and info["height"] > args.max_height:
+        vf.append(f"scale=-2:{args.max_height}")
+    vf_expr = ",".join(vf) if vf else "null"
+
+    inputs = [ffmpeg(), "-y", "-i", str(raw)]
+    if lead > 0:
+        inputs += ["-ss", f"{lead:.3f}"]
+    inputs += ["-i", str(sys_path)]
+
+    ms = int(abs(lead) * 1000) if lead < 0 else 0
+    has_mic = bool(info.get("has_audio"))
+    parts = [f"[0:v]{vf_expr}[v]"]
+    if audio_mode == "system" or not has_mic:
+        if ms:
+            parts.append(f"[1:a]adelay={ms}|{ms}[a]")
+        else:
+            parts.append("[1:a]anull[a]")
+    else:
+        if ms:
+            parts.append(f"[1:a]adelay={ms}|{ms}[s]")
+        else:
+            parts.append("[1:a]anull[s]")
+        parts.append("[0:a][s]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[a]")
+
+    cmd = inputs + [
+        "-filter_complex", ";".join(parts),
+        "-map", "[v]", "-map", "[a]",
+        "-t", f"{info['duration']:.3f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart", str(out),
+    ]
+    run(cmd, timeout=3600)
+    return True
+
+
 # ---------------------------------------------------------------- 录制
 
 
 def cmd_record(args) -> int:
     preflight("ffmpeg")
     sc = screencapture()
+    audio_mode = resolve_audio_mode(args)
     duration = float(args.duration) if args.duration else 0.0
     outdir, stem = resolve_out_dir(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -566,7 +727,7 @@ def cmd_record(args) -> int:
             "打开面板：python3 scripts/screen_rec.py permissions --open\n"
             "（确认已授权但仍误判时加 --force）"
         )
-    if args.audio == "mic" and layout:
+    if audio_mode in ("mic", "mix") and layout:
         mic = layout.get("microphone")
         if mic in ("denied", "restricted"):
             raise RecError(
@@ -608,9 +769,36 @@ def cmd_record(args) -> int:
         else:
             meta_events = events_path
 
+    if audio_mode in ("system", "mix"):
+        chk = system_audio_check()
+        if not chk.get("available"):
+            raise RecError(
+                "当前环境无法采集电脑播放的声音：" + str(chk.get("reason") or "需要 macOS 13+") + "\n"
+                "可以改用 --audio mic（只录旁白）或 --audio none（静音）。"
+            )
+        if not chk.get("screen_capture", True):
+            raise RecError(
+                "采集电脑声音需要屏幕录制权限。\n"
+                "系统设置 → 隐私与安全性 → 屏幕录制，勾选终端/宿主 App 后完全重启它。\n"
+                "打开面板：python3 scripts/screen_rec.py permissions --open"
+            )
+
     if args.countdown and args.countdown > 0:
         print(f"⏳ {args.countdown} 秒后开始录制…（可切到目标窗口）")
         time.sleep(args.countdown)
+
+    sys_proc = None
+    sys_start = None
+    sys_path = outdir / f"{stem}.system.m4a"
+    if audio_mode in ("system", "mix"):
+        print("🎧 正在启动系统音频采集…")
+        sys_proc, sys_start, note = start_system_audio(sys_path, duration)
+        if sys_proc is None:
+            stop_event_tap(tap)
+            if audio_mode == "system":
+                raise RecError(f"系统音频采集失败：{note}\n可以改用 --audio mic 或 --audio none。")
+            print(f"⚠️ 系统音频采集失败：{note}；本次降级为仅麦克风", file=sys.stderr)
+            audio_mode = "mic"
 
     cmd = [sc, "-x", "-v"]
     if duration > 0:
@@ -623,12 +811,10 @@ def cmd_record(args) -> int:
         cmd.append("-C")
     if args.clicks:
         cmd.append("-k")
-    if args.audio == "mic":
+    if audio_mode in ("mic", "mix"):
         cmd.append("-g")
-    elif args.audio and args.audio != "none":
-        if not str(args.audio).isdigit():
-            raise RecError("--audio 只接受 none / mic / 数字设备 ID")
-        cmd += ["-G", str(args.audio)]
+    elif audio_mode not in ("none", "system"):
+        cmd += ["-G", str(audio_mode)]
     cmd.append(str(raw))
 
     if duration > 0:
@@ -669,6 +855,7 @@ def cmd_record(args) -> int:
     finally:
         stop_process(overlay)
         stop_event_tap(tap)
+        stop_process(sys_proc)
 
     if rc != 0 and rc != 1:
         raise RecError(f"screencapture 退出码 {rc}（录制可能被中断）")
@@ -686,31 +873,49 @@ def cmd_record(args) -> int:
     if meta_events:
         events = read_events(meta_events, video_start, duration_actual)
 
-    # 转 mp4（默认压缩）
+    # 转 mp4（默认压缩；system/mix 先合成系统音频）
     out = unique_path(outdir / f"{stem}.mp4")
-    if args.no_compress:
-        cmd2 = [ffmpeg(), "-y", "-i", str(raw), "-c:v", "copy"]
-        if info["has_audio"]:
-            cmd2 += ["-c:a", "aac", "-b:a", "192k"]
-        cmd2 += ["-movflags", "+faststart", str(out)]
+    sys_lead = (video_start - sys_start) if sys_start is not None else None
+    used_system_audio = False
+    if audio_mode in ("system", "mix") and args.no_compress:
+        print("ℹ️  系统音频/混音需要重新编码，已忽略 --no-compress", file=sys.stderr)
+    if audio_mode in ("system", "mix") and sys_path.exists() and sys_lead is not None:
+        try:
+            used_system_audio = transcode_with_system_audio(
+                raw, out, info, audio_mode, sys_path, sys_lead, args
+            )
+        except RecError as e:
+            print(f"⚠️ 系统音频合成失败：{e}；回退到原始音频", file=sys.stderr)
+            used_system_audio = False
+    if not used_system_audio and audio_mode == "system":
+        print("⚠️ 系统音频不可用，输出为静音视频", file=sys.stderr)
+
+    if used_system_audio:
+        print("🎞  正在合成 mp4（画面 + 系统音频）…")
     else:
-        vf = []
-        if args.fps and args.fps > 0:
-            vf.append(f"fps={args.fps}")
-        if args.max_height and args.max_height > 0 and info["height"] > args.max_height:
-            vf.append(f"scale=-2:{args.max_height}")
-        cmd2 = [ffmpeg(), "-y", "-i", str(raw)]
-        if vf:
-            cmd2 += ["-vf", ",".join(vf)]
-        cmd2 += [
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        ]
-        if info["has_audio"]:
-            cmd2 += ["-c:a", "aac", "-b:a", "160k"]
-        cmd2.append(str(out))
-    print("🎞  正在转码 mp4 …")
-    run(cmd2, timeout=3600)
+        if args.no_compress:
+            cmd2 = [ffmpeg(), "-y", "-i", str(raw), "-c:v", "copy"]
+            if info["has_audio"]:
+                cmd2 += ["-c:a", "aac", "-b:a", "192k"]
+            cmd2 += ["-movflags", "+faststart", str(out)]
+        else:
+            vf = []
+            if args.fps and args.fps > 0:
+                vf.append(f"fps={args.fps}")
+            if args.max_height and args.max_height > 0 and info["height"] > args.max_height:
+                vf.append(f"scale=-2:{args.max_height}")
+            cmd2 = [ffmpeg(), "-y", "-i", str(raw)]
+            if vf:
+                cmd2 += ["-vf", ",".join(vf)]
+            cmd2 += [
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            ]
+            if info["has_audio"]:
+                cmd2 += ["-c:a", "aac", "-b:a", "160k"]
+            cmd2.append(str(out))
+        print("🎞  正在转码 mp4 …")
+        run(cmd2, timeout=3600)
 
     final = probe(out)
 
@@ -723,6 +928,11 @@ def cmd_record(args) -> int:
             raw.unlink()
         except OSError:
             pass
+    if sys_path.exists() and not args.keep_audio:
+        try:
+            sys_path.unlink()
+        except OSError:
+            pass
 
     meta = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -732,6 +942,7 @@ def cmd_record(args) -> int:
         "height": final["height"],
         "fps": final["fps"],
         "has_audio": final["has_audio"],
+        "audio": {"mode": audio_mode, "system_audio_used": used_system_audio},
         "video_start_epoch": round(video_start, 3),
         "recording": {"mode": mode, "display": args.display or 1, "region": region},
         "screen_layout": layout,
@@ -1585,12 +1796,20 @@ def cmd_ensure(args) -> int:
             progress("   请手动安装：xcode-select --install")
 
     if compiler:
-        for name in ("screen_info", "ocr", "event_tap", "rec_overlay"):
+        for name in ("screen_info", "ocr", "event_tap", "rec_overlay", "system_audio"):
             try:
                 p = ensure_helper(name)
                 add(f"辅助程序 {name}", True, str(p), level="optional")
             except RecError as e:
                 add(f"辅助程序 {name}", False, str(e), level="optional")
+
+    try:
+        chk = system_audio_check()
+        add("系统音频采集（电脑声音）", chk.get("available"),
+            "可用（macOS 13+ ScreenCaptureKit）" if chk.get("available") else str(chk.get("reason") or "不可用"),
+            level="optional")
+    except RecError as e:
+        add("系统音频采集（电脑声音）", False, str(e), level="optional")
 
     font = next((p for p in FONT_CANDIDATES if Path(p).exists()), None)
     add("中文字体", bool(font), font or "未找到", level="optional")
@@ -1736,7 +1955,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("-d", "--duration", type=float, help="录制时长（秒）；不填则 Ctrl+C 停止")
     r.add_argument("--region", help="录制区域 x,y,w,h（全局坐标，单位 point）")
     r.add_argument("--display", type=int, help="录制指定屏幕（1=主屏）")
-    r.add_argument("--audio", default="none", help="none | mic（默认输入）| 数字设备 ID")
+    r.add_argument("--audio", default=None,
+                   help="none | system（电脑声音）| mic（麦克风）| mix（两者混音）| 数字设备 ID；不填时交互询问")
+    r.add_argument("--keep-audio", action="store_true", help="保留系统音频中间文件")
     r.add_argument("--cursor", action="store_true", help="录制鼠标指针")
     r.add_argument("--clicks", action="store_true", help="在视频中显示点击效果")
     r.add_argument("--no-events", action="store_true", help="不采集点击/快捷键事件")

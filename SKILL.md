@@ -1,7 +1,7 @@
 ---
 name: mac-screen-record
 description: macOS 命令行录屏与视频处理一条龙：录屏转 mp4（可指定时长/区域/显示器/麦克风）、截图、视频切片、转 GIF、压缩，以及智能加字幕（点击/快捷键事件采集 + Vision OCR 自动生成，或抽关键帧由 Agent 读图写字幕后烧录）。触发词：录屏、录制屏幕、屏幕录制、录个视频、录教程、加字幕、视频转gif、视频切片、剪视频、截屏、screenshot、screen record。不用于：非 macOS 平台、直播推流。
-version: 1.3.1
+version: 1.4.0
 ---
 
 # mac-screen-record
@@ -41,7 +41,7 @@ python3 scripts/screen_rec.py permissions --request # 触发系统授权弹窗�
 
 | 权限 | 用途 | 缺失时的行为 |
 |---|---|---|
-| 屏幕录制 | 录屏、截图 | `record` / `shot` 直接报错并给出设置路径，不会产出无效文件 |
+| 屏幕录制 | 录屏、截图、采集电脑声音 | `record` / `shot` 直接报错并给出设置路径，不会产出无效文件 |
 | 输入监控 | 点击/快捷键事件采集（智能字幕自动模式） | 录屏照常；事件采集降级，字幕自动转「抽帧 + AI 读图」 |
 | 辅助功能 | 部分系统版本的事件采集兜底 | 一般不需要；事件采集失败时再试 |
 | 麦克风 | `--audio mic` 录人声 | 开启时先检查；未询问则首次录制弹系统授权 |
@@ -69,6 +69,14 @@ python3 scripts/screen_rec.py permissions --request # 触发系统授权弹窗�
 
 ## 录屏
 
+**开始录制前先确认声音模式**（用户已明确时跳过）。用 AskUserQuestion 问：
+
+1. 纯录屏，无声音 → `--audio none`
+2. 录屏 + 电脑播放的声音 → `--audio system`
+3. 录屏 + 讲解旁白 → `--audio mic`
+4. 录屏 + 电脑声音 + 讲解旁白（混音）→ `--audio mix`
+5. 指定音频设备（高级）→ `--audio <设备ID>`
+
 ```bash
 # 录 30 秒，默认 1080p / 30fps / mp4
 python3 scripts/screen_rec.py record -d 30
@@ -82,6 +90,10 @@ python3 scripts/screen_rec.py record --region 0,0,1200,800 -d 10
 # 录第二块屏 / 录麦克风 / 显示鼠标与点击效果
 python3 scripts/screen_rec.py record --display 2 -d 10
 python3 scripts/screen_rec.py record --audio mic -d 30 --cursor --clicks
+
+# 录电脑里播放的声音 / 电脑声音 + 讲解旁白
+python3 scripts/screen_rec.py record -d 30 --audio system
+python3 scripts/screen_rec.py record -d 30 --audio mix
 
 # 不定时长：Ctrl+C 停止
 python3 scripts/screen_rec.py record
@@ -103,7 +115,22 @@ python3 scripts/screen_rec.py record
 - 总时长：默认取 `-d` 的值，可 `--overlay-total 90` 覆盖
 - 悬浮窗显示在录制的那块屏上（跟随 `--display`）
 
-音频：默认静音；`--audio mic` 录默认输入；系统内录需先装 BlackHole 等虚拟声卡，再用 `--audio <设备ID>`（`-G`）。录 iPhone 真机屏幕不在本技能范围（用 QuickTime）。
+### 声音模式
+
+| 模式 | 参数 | 说明 |
+|---|---|---|
+| 纯录屏 | `--audio none` | 默认；不采集任何声音 |
+| 电脑声音 | `--audio system` | 用 ScreenCaptureKit 采集系统音频，**不需要 BlackHole**；macOS 13+ |
+| 讲解旁白 | `--audio mic` | 默认输入设备（麦克风） |
+| 两者混音 | `--audio mix` | 电脑声音 + 麦克风混成一条；两边的权限都要有 |
+| 指定设备 | `--audio <数字ID>` | 高级；外接声卡 / 虚拟声卡的 CoreAudio ID |
+
+- `--audio` 不填且运行在交互终端时，会弹出 1–5 的选择菜单；**Agent 场景请在调用前用 AskUserQuestion 询问**，再把结果转成 `--audio` 参数。
+- `system` / `mix` 需要屏幕录制权限（系统音频由 ScreenCaptureKit 采集）和 macOS 13+；`mic` / `mix` 需要麦克风权限。
+- 系统声音采集与输出设备无关：AirPods、扬声器、甚至系统静音时都能录到系统音频。
+- 用扬声器外放 + 麦克风同时录时，麦克风可能把外放声音再收一遍造成回声，建议戴耳机。
+- `--keep-audio` 保留系统音频中间文件 `<视频>.system.m4a`，便于排查。
+- 录 iPhone 真机屏幕不在本技能范围（用 QuickTime）。
 
 ## 截图
 
