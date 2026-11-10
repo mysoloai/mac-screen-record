@@ -1,6 +1,6 @@
 # mac-screen-record
 
-一个供 AI Agent 调用的 macOS 录屏技能，也可以直接从命令行使用。支持屏幕录制、截图、视频切片、GIF、压缩和操作字幕。
+一个供 AI Agent 调用的 macOS 录屏技能，也可以直接从命令行使用。支持屏幕录制、电脑声音 / 麦克风 / 混音、截图、视频切片、GIF、压缩和操作字幕。
 
 ## 安装
 
@@ -18,6 +18,8 @@ ln -s "$(pwd)/mac-screen-record" ~/.agents/skills/mac-screen-record
 python3 scripts/screen_rec.py ensure --check
 python3 scripts/screen_rec.py permissions
 python3 scripts/screen_rec.py record -d 30
+python3 scripts/screen_rec.py record -d 30 --audio system   # 电脑里播放的声音
+python3 scripts/screen_rec.py record -d 30 --audio mix      # 电脑声音 + 讲解旁白
 python3 scripts/screen_rec.py gif demo.mp4 --width 800 --fps 12
 python3 scripts/screen_rec.py subtitle auto demo.mp4 --burn
 ```
@@ -26,7 +28,7 @@ python3 scripts/screen_rec.py subtitle auto demo.mp4 --burn
 
 ## 数据与限制
 
-录制默认保存在本机桌面 Recordings 目录。默认采集点击坐标、组合键键码与前台应用名，写入视频旁的事件文件；可使用 `--no-events` 关闭。屏幕视频和 OCR 文字可能包含敏感信息，分享前请自行检查。麦克风默认关闭。此工具仅适用于 macOS；事件字幕依赖系统权限，OCR 可能识别错误。
+录制默认保存在本机桌面 Recordings 目录。默认采集点击坐标、组合键键码与前台应用名，写入视频旁的事件文件；可使用 `--no-events` 关闭。屏幕视频和 OCR 文字可能包含敏感信息，分享前请自行检查。声音默认关闭（`--audio none`）；可选电脑声音（`--audio system`）、麦克风（`--audio mic`）或两者混音（`--audio mix`）。系统声音采集需要 macOS 13+ 和屏幕录制权限，麦克风与混音需要麦克风权限。此工具仅适用于 macOS；事件字幕依赖系统权限，OCR 可能识别错误。
 
 ## License
 
